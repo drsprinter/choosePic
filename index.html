@@ -299,6 +299,8 @@
   </div>
 
   <script>
+    const API_BASE = "https://makeup-enz8.onrender.com";
+
     let pairs = [];
     let currentIndex = 0;
     let pairStartTime = null;
@@ -340,10 +342,27 @@
     const downloadButtonDone = document.getElementById("downloadButtonDone");
 
     async function loadPairs() {
-      const res = await fetch(`/api/pairs?user_id=${encodeURIComponent(userId)}`);
+      const url = `${API_BASE}/api/pairs?user_id=${encodeURIComponent(userId)}`;
+
+      const res = await fetch(url);
 
       if (!res.ok) {
-        alert("ペアデータの読み込みに失敗しました");
+        let message = "";
+
+        try {
+          const errorData = await res.json();
+          message = JSON.stringify(errorData, null, 2);
+        } catch (e) {
+          message = await res.text();
+        }
+
+        alert(
+          "ペアデータの読み込みに失敗しました\n\n" +
+          "status: " + res.status + "\n" +
+          "url: " + url + "\n\n" +
+          message
+        );
+
         return;
       }
 
@@ -365,8 +384,8 @@
 
       const pair = pairs[currentIndex];
 
-      leftImage.src = pair.left_image_url;
-      rightImage.src = pair.right_image_url;
+      leftImage.src = API_BASE + pair.left_image_url;
+      rightImage.src = API_BASE + pair.right_image_url;
 
       leftFileName.textContent = pair.left_file;
       rightFileName.textContent = pair.right_file;
@@ -378,7 +397,8 @@
       progressText.textContent = `${currentIndex + 1} / ${pairs.length}`;
       progressFill.style.width = `${percent}%`;
 
-      sessionInfo.textContent = `user_id: ${userId.slice(0, 8)}... / session_id: ${sessionId.slice(0, 8)}...`;
+      sessionInfo.textContent =
+        `user_id: ${userId.slice(0, 8)}... / session_id: ${sessionId.slice(0, 8)}...`;
 
       pairStartTime = performance.now();
     }
@@ -400,7 +420,7 @@
         reaction_time_ms: reactionTimeMs
       };
 
-      const res = await fetch("/api/choice", {
+      const res = await fetch(`${API_BASE}/api/choice`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -409,7 +429,21 @@
       });
 
       if (!res.ok) {
-        alert("保存に失敗しました");
+        let message = "";
+
+        try {
+          const errorData = await res.json();
+          message = JSON.stringify(errorData, null, 2);
+        } catch (e) {
+          message = await res.text();
+        }
+
+        alert(
+          "保存に失敗しました\n\n" +
+          "status: " + res.status + "\n\n" +
+          message
+        );
+
         return;
       }
 
@@ -423,7 +457,7 @@
     }
 
     function downloadResults() {
-      window.location.href = "/api/results/download";
+      window.location.href = `${API_BASE}/api/results/download`;
     }
 
     startButton.addEventListener("click", async () => {
