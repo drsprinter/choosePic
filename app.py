@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
 import pandas as pd
 import uuid
 import hashlib
@@ -12,12 +11,23 @@ import random
 import threading
 
 
+# =========================
+# パス設定
+# =========================
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 STATIC_DIR = BASE_DIR / "static"
 
+INDEX_HTML = BASE_DIR / "index.html"
+
 PAIRS_CSV = DATA_DIR / "nail_near_pairs.csv"
 RESULTS_CSV = DATA_DIR / "results.csv"
+
+
+# =========================
+# 結果CSVの列
+# =========================
 
 RESULT_COLUMNS = [
     "response_id",
@@ -34,12 +44,28 @@ RESULT_COLUMNS = [
     "distance",
 ]
 
+
+# =========================
+# アプリ初期化
+# =========================
+
 app = FastAPI()
 
+# Render / GitHubでフォルダがない場合でも起動だけは落ちないようにする
+DATA_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
+(STATIC_DIR / "images").mkdir(exist_ok=True)
+
+# /static/images/xxx.png で画像を配信
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# CSV同時書き込み対策
 csv_lock = threading.Lock()
 
+
+# =========================
+# リクエストモデル
+# =========================
 
 class ChoiceRequest(BaseModel):
     user_id: str
@@ -55,29 +81,70 @@ class ChoiceRequest(BaseModel):
     reaction_time_ms: int
 
 
+# =========================
+# ルート
+# =========================
+
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    """
+    index.html は static の外、
+    app.py と同じ階層に置く想定。
+    """
+    if not INDEX_HTML.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"index.html not found at {INDEX_HTML}"
+        )
 
+    return FileResponse(INDEX_HTML)
+
+
+# =========================
+# 内部関数
+# =========================
 
 def load_pairs_df() -> pd.DataFrame:
-    if not PAIRS_CSV.exists():
-        raise HTTPException(status_code=404, detail="nail_near_pairs.csv not found")
+    """
+    ペアCSVを読み込む。
+    必須列:
+    pair_id, file_1, file_2, distance
+    """
 
-    df = pd.read_csv(PAIRS_CSV)
+    if not PAIRS_CSV.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"nail_near_pairs.csv not found at {PAIRS_CSV}"
+        )
+
+    try:
+        df = pd.read_csv(PAIRS_CSV)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read nail_near_pairs.csv: {str(e)}"
+        )
 
     required_cols = ["pair_id", "file_1", "file_2", "distance"]
+
     for col in required_cols:
         if col not in df.columns:
             raise HTTPException(
                 status_code=400,
-                detail=f"Required column missing: {col}"
+                detail=f"Required column missing: {col}. Current columns: {list(df.columns)}"
             )
+
+    # 念のため欠損を除外
+    df = df.dropna(subset=required_cols)
 
     return df
 
 
 def get_answered_pair_ids(user_id: str) -> set[int]:
+    """
+    指定ユーザーがすでに回答したpair_id一覧を取得。
+    """
+
     if not RESULTS_CSV.exists():
         return set()
 
@@ -85,8 +152,13 @@ def get_answered_pair_ids(user_id: str) -> set[int]:
         results_df = pd.read_csv(RESULTS_CSV)
     except pd.errors.EmptyDataError:
         return set()
+    except Exception:
+        return set()
 
     if results_df.empty:
+        return set()
+
+    if "user_id" not in results_df.columns or "pair_id" not in results_df.columns:
         return set()
 
     user_results = results_df[results_df["user_id"] == user_id]
@@ -95,9 +167,17 @@ def get_answered_pair_ids(user_id: str) -> set[int]:
 
 
 def stable_seed(text: str) -> int:
+    """
+    user_idごとに毎回同じランダム順になるようにする。
+    """
+
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16)
 
+
+# =========================
+# API
+# =========================
 
 @app.get("/api/pairs")
 def get_pairs(
@@ -105,8 +185,10 @@ def get_pairs(
     include_answered: bool = Query(False)
 ):
     """
-    ユーザーごとにランダム化されたペア一覧を返す。
-    すでに回答済みのpair_idはデフォルトで除外。
+    ペアデータを返す。
+    - ユーザーごとに表示順をランダム化
+    - 左右もユーザーごと・ペアごとにランダム化
+    - 回答済みペアはデフォルトで除外
     """
 
     df = load_pairs_df()
@@ -128,7 +210,7 @@ def get_pairs(
         file_1 = str(row["file_1"])
         file_2 = str(row["file_2"])
 
-        # ペアごと・ユーザーごとに左右を固定ランダム化
+        # ユーザーごと・pair_idごとに左右を固定ランダム化
         rng_side = random.Random(stable_seed(f"side:{user_id}:{pair_id}"))
 
         if rng_side.random() < 0.5:
@@ -157,8 +239,8 @@ def get_pairs(
 def save_choice(choice: ChoiceRequest):
     """
     選択結果をCSVに追記。
-    left / right の場合のみ chosen_file / rejected_file を決定。
-    それ以外は chosen_file / rejected_file を空欄にする。
+    left/right の場合のみ chosen_file/rejected_file を入れる。
+    both_like, both_dislike, unsure, skip は空欄。
     """
 
     allowed_choice_types = {
@@ -171,22 +253,44 @@ def save_choice(choice: ChoiceRequest):
     }
 
     if choice.choice_type not in allowed_choice_types:
-        raise HTTPException(status_code=400, detail="Invalid choice_type")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid choice_type: {choice.choice_type}"
+        )
 
     df = load_pairs_df()
-    pair_df = df[df["pair_id"] == choice.pair_id]
+    pair_df = df[df["pair_id"].astype(int) == int(choice.pair_id)]
 
     if pair_df.empty:
-        raise HTTPException(status_code=404, detail="pair_id not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"pair_id not found: {choice.pair_id}"
+        )
 
     pair_row = pair_df.iloc[0]
-    valid_files = {str(pair_row["file_1"]), str(pair_row["file_2"])}
+
+    valid_files = {
+        str(pair_row["file_1"]),
+        str(pair_row["file_2"]),
+    }
 
     if choice.left_file not in valid_files or choice.right_file not in valid_files:
-        raise HTTPException(status_code=400, detail="Presented files do not match pair")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Presented files do not match pair",
+                "pair_id": choice.pair_id,
+                "valid_files": list(valid_files),
+                "left_file": choice.left_file,
+                "right_file": choice.right_file,
+            }
+        )
 
     if choice.left_file == choice.right_file:
-        raise HTTPException(status_code=400, detail="left_file and right_file are same")
+        raise HTTPException(
+            status_code=400,
+            detail="left_file and right_file are same"
+        )
 
     chosen_file = ""
     rejected_file = ""
@@ -214,8 +318,6 @@ def save_choice(choice: ChoiceRequest):
         "distance": float(pair_row["distance"]),
     }
 
-    DATA_DIR.mkdir(exist_ok=True)
-
     with csv_lock:
         result_df = pd.DataFrame([result], columns=RESULT_COLUMNS)
 
@@ -242,6 +344,10 @@ def save_choice(choice: ChoiceRequest):
 
 @app.get("/api/progress")
 def get_progress(user_id: str = Query(...)):
+    """
+    進捗確認用。
+    """
+
     pairs_df = load_pairs_df()
     total_pairs = len(pairs_df)
 
@@ -258,6 +364,10 @@ def get_progress(user_id: str = Query(...)):
 
 @app.get("/api/results")
 def get_results():
+    """
+    保存済み結果をJSONで確認。
+    """
+
     if not RESULTS_CSV.exists():
         return {
             "total": 0,
@@ -271,6 +381,11 @@ def get_results():
             "total": 0,
             "results": []
         }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read results.csv: {str(e)}"
+        )
 
     return {
         "total": len(df),
@@ -280,11 +395,66 @@ def get_results():
 
 @app.get("/api/results/download")
 def download_results():
+    """
+    結果CSVをダウンロード。
+    """
+
     if not RESULTS_CSV.exists():
-        raise HTTPException(status_code=404, detail="results.csv not found")
+        raise HTTPException(
+            status_code=404,
+            detail="results.csv not found"
+        )
 
     return FileResponse(
         RESULTS_CSV,
         media_type="text/csv",
         filename="nail_choice_results.csv"
+    )
+
+
+@app.get("/api/debug")
+def debug():
+    """
+    Render上でファイル配置を確認するためのデバッグ用。
+    """
+
+    return {
+        "base_dir": str(BASE_DIR),
+        "index_html": str(INDEX_HTML),
+        "index_html_exists": INDEX_HTML.exists(),
+
+        "data_dir": str(DATA_DIR),
+        "data_dir_exists": DATA_DIR.exists(),
+        "data_files": [p.name for p in DATA_DIR.glob("*")] if DATA_DIR.exists() else [],
+
+        "pairs_csv": str(PAIRS_CSV),
+        "pairs_csv_exists": PAIRS_CSV.exists(),
+
+        "static_dir": str(STATIC_DIR),
+        "static_dir_exists": STATIC_DIR.exists(),
+        "static_files": [p.name for p in STATIC_DIR.glob("*")] if STATIC_DIR.exists() else [],
+
+        "images_dir": str(STATIC_DIR / "images"),
+        "images_dir_exists": (STATIC_DIR / "images").exists(),
+        "image_files_sample": [
+            p.name for p in (STATIC_DIR / "images").glob("*")
+        ][:20] if (STATIC_DIR / "images").exists() else [],
+    }
+
+
+# =========================
+# python app.py で起動された場合にも動くようにする
+# =========================
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False
     )
