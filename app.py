@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
@@ -51,15 +52,22 @@ RESULT_COLUMNS = [
 
 app = FastAPI()
 
-# Render / GitHubでフォルダがない場合でも起動だけは落ちないようにする
+# GitHub Pagesなど、別URLのHTMLからRender APIを叩けるようにする
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 DATA_DIR.mkdir(exist_ok=True)
 STATIC_DIR.mkdir(exist_ok=True)
 (STATIC_DIR / "images").mkdir(exist_ok=True)
 
-# /static/images/xxx.png で画像を配信
+# /static/images/xxx.png で画像配信
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# CSV同時書き込み対策
 csv_lock = threading.Lock()
 
 
@@ -82,15 +90,11 @@ class ChoiceRequest(BaseModel):
 
 
 # =========================
-# ルート
+# トップページ
 # =========================
 
 @app.get("/")
 def index():
-    """
-    index.html は static の外、
-    app.py と同じ階層に置く想定。
-    """
     if not INDEX_HTML.exists():
         raise HTTPException(
             status_code=404,
@@ -105,12 +109,6 @@ def index():
 # =========================
 
 def load_pairs_df() -> pd.DataFrame:
-    """
-    ペアCSVを読み込む。
-    必須列:
-    pair_id, file_1, file_2, distance
-    """
-
     if not PAIRS_CSV.exists():
         raise HTTPException(
             status_code=404,
@@ -134,17 +132,12 @@ def load_pairs_df() -> pd.DataFrame:
                 detail=f"Required column missing: {col}. Current columns: {list(df.columns)}"
             )
 
-    # 念のため欠損を除外
     df = df.dropna(subset=required_cols)
 
     return df
 
 
 def get_answered_pair_ids(user_id: str) -> set[int]:
-    """
-    指定ユーザーがすでに回答したpair_id一覧を取得。
-    """
-
     if not RESULTS_CSV.exists():
         return set()
 
@@ -167,10 +160,6 @@ def get_answered_pair_ids(user_id: str) -> set[int]:
 
 
 def stable_seed(text: str) -> int:
-    """
-    user_idごとに毎回同じランダム順になるようにする。
-    """
-
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16)
 
@@ -184,13 +173,6 @@ def get_pairs(
     user_id: str = Query(...),
     include_answered: bool = Query(False)
 ):
-    """
-    ペアデータを返す。
-    - ユーザーごとに表示順をランダム化
-    - 左右もユーザーごと・ペアごとにランダム化
-    - 回答済みペアはデフォルトで除外
-    """
-
     df = load_pairs_df()
 
     if not include_answered:
@@ -199,7 +181,6 @@ def get_pairs(
 
     records = df.to_dict(orient="records")
 
-    # ユーザーごとに表示順を固定ランダム化
     rng_order = random.Random(stable_seed(f"order:{user_id}"))
     rng_order.shuffle(records)
 
@@ -210,7 +191,6 @@ def get_pairs(
         file_1 = str(row["file_1"])
         file_2 = str(row["file_2"])
 
-        # ユーザーごと・pair_idごとに左右を固定ランダム化
         rng_side = random.Random(stable_seed(f"side:{user_id}:{pair_id}"))
 
         if rng_side.random() < 0.5:
@@ -237,12 +217,6 @@ def get_pairs(
 
 @app.post("/api/choice")
 def save_choice(choice: ChoiceRequest):
-    """
-    選択結果をCSVに追記。
-    left/right の場合のみ chosen_file/rejected_file を入れる。
-    both_like, both_dislike, unsure, skip は空欄。
-    """
-
     allowed_choice_types = {
         "left",
         "right",
@@ -344,10 +318,6 @@ def save_choice(choice: ChoiceRequest):
 
 @app.get("/api/progress")
 def get_progress(user_id: str = Query(...)):
-    """
-    進捗確認用。
-    """
-
     pairs_df = load_pairs_df()
     total_pairs = len(pairs_df)
 
@@ -364,10 +334,6 @@ def get_progress(user_id: str = Query(...)):
 
 @app.get("/api/results")
 def get_results():
-    """
-    保存済み結果をJSONで確認。
-    """
-
     if not RESULTS_CSV.exists():
         return {
             "total": 0,
@@ -395,10 +361,6 @@ def get_results():
 
 @app.get("/api/results/download")
 def download_results():
-    """
-    結果CSVをダウンロード。
-    """
-
     if not RESULTS_CSV.exists():
         raise HTTPException(
             status_code=404,
@@ -414,10 +376,6 @@ def download_results():
 
 @app.get("/api/debug")
 def debug():
-    """
-    Render上でファイル配置を確認するためのデバッグ用。
-    """
-
     return {
         "base_dir": str(BASE_DIR),
         "index_html": str(INDEX_HTML),
@@ -443,7 +401,7 @@ def debug():
 
 
 # =========================
-# python app.py で起動された場合にも動くようにする
+# python app.py 起動にも対応
 # =========================
 
 if __name__ == "__main__":
