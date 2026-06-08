@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime
@@ -109,6 +110,12 @@ def index():
 # =========================
 
 def load_pairs_df() -> pd.DataFrame:
+    """
+    ペアCSVを読み込む。
+    必須列:
+    pair_id, file_1, file_2, distance
+    """
+
     if not PAIRS_CSV.exists():
         raise HTTPException(
             status_code=404,
@@ -138,6 +145,11 @@ def load_pairs_df() -> pd.DataFrame:
 
 
 def get_answered_pair_ids(user_id: str) -> set[int]:
+    """
+    指定ユーザーがすでに回答したpair_id一覧を取得。
+    results.csv がリセットされた後は空になる。
+    """
+
     if not RESULTS_CSV.exists():
         return set()
 
@@ -160,6 +172,10 @@ def get_answered_pair_ids(user_id: str) -> set[int]:
 
 
 def stable_seed(text: str) -> int:
+    """
+    user_idごとに毎回同じランダム順になるようにする。
+    """
+
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return int(digest[:16], 16)
 
@@ -173,6 +189,13 @@ def get_pairs(
     user_id: str = Query(...),
     include_answered: bool = Query(False)
 ):
+    """
+    ペアデータを返す。
+    - ユーザーごとに表示順をランダム化
+    - 左右もユーザーごと・ペアごとにランダム化
+    - 回答済みペアはデフォルトで除外
+    """
+
     df = load_pairs_df()
 
     if not include_answered:
@@ -217,6 +240,12 @@ def get_pairs(
 
 @app.post("/api/choice")
 def save_choice(choice: ChoiceRequest):
+    """
+    選択結果をCSVに追記。
+    left/right の場合のみ chosen_file/rejected_file を入れる。
+    both_like, both_dislike, unsure, skip は chosen/rejected を空欄にする。
+    """
+
     allowed_choice_types = {
         "left",
         "right",
@@ -318,6 +347,10 @@ def save_choice(choice: ChoiceRequest):
 
 @app.get("/api/progress")
 def get_progress(user_id: str = Query(...)):
+    """
+    進捗確認用。
+    """
+
     pairs_df = load_pairs_df()
     total_pairs = len(pairs_df)
 
@@ -334,6 +367,10 @@ def get_progress(user_id: str = Query(...)):
 
 @app.get("/api/results")
 def get_results():
+    """
+    保存済み結果をJSONで確認。
+    """
+
     if not RESULTS_CSV.exists():
         return {
             "total": 0,
@@ -361,21 +398,68 @@ def get_results():
 
 @app.get("/api/results/download")
 def download_results():
+    """
+    結果CSVをダウンロード。
+    ダウンロード完了後に results.csv を削除してリセットする。
+    """
+
     if not RESULTS_CSV.exists():
         raise HTTPException(
             status_code=404,
             detail="results.csv not found"
         )
 
+    def delete_results_file():
+        """
+        FileResponseの送信完了後に実行される。
+        ここで results.csv を削除する。
+        """
+        try:
+            with csv_lock:
+                if RESULTS_CSV.exists():
+                    RESULTS_CSV.unlink()
+                    print("results.csv deleted after download")
+        except Exception as e:
+            print(f"Failed to delete results.csv: {e}")
+
     return FileResponse(
         RESULTS_CSV,
         media_type="text/csv",
-        filename="nail_choice_results.csv"
+        filename="nail_choice_results.csv",
+        background=BackgroundTask(delete_results_file)
     )
+
+
+@app.post("/api/results/reset")
+def reset_results():
+    """
+    手動リセット用。
+    必要なら管理者が叩ける。
+    """
+
+    try:
+        with csv_lock:
+            if RESULTS_CSV.exists():
+                RESULTS_CSV.unlink()
+
+        return {
+            "status": "ok",
+            "message": "results.csv reset"
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset results.csv: {str(e)}"
+        )
 
 
 @app.get("/api/debug")
 def debug():
+    """
+    Render上でファイル配置を確認するためのデバッグ用。
+    """
+
     return {
         "base_dir": str(BASE_DIR),
         "index_html": str(INDEX_HTML),
@@ -387,6 +471,9 @@ def debug():
 
         "pairs_csv": str(PAIRS_CSV),
         "pairs_csv_exists": PAIRS_CSV.exists(),
+
+        "results_csv": str(RESULTS_CSV),
+        "results_csv_exists": RESULTS_CSV.exists(),
 
         "static_dir": str(STATIC_DIR),
         "static_dir_exists": STATIC_DIR.exists(),
